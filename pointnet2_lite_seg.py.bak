@@ -1,0 +1,498 @@
+import argparse
+from pathlib import Path
+import warnings
+import numpy as np
+import torch
+import torch.nn.functional as F
+from plyfile import PlyData
+
+# Silencia el FutureWarning de torch.load (molesta pero no afecta)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"You are using `torch\.load` with `weights_only=False`.*",
+)
+
+# ----------------------------
+# Utils de dataset / métricas
+# ----------------------------
+def _find_label_key(names):
+    for k in ["class", "label", "semantic", "classification", "category", "category_id", "seg_label"]:
+        if k in names:
+            return k
+    return None
+
+
+def normalize_feats(X):
+    """Robust scaling por mediana + IQR (como en tu eval_tile.py)."""
+    med = np.median(X, axis=0, keepdims=True)
+    q1 = np.percentile(X, 25, axis=0, keepdims=True)
+    q3 = np.percentile(X, 75, axis=0, keepdims=True)
+    iqr = np.maximum(1e-6, (q3 - q1))
+    return ((X - med) / iqr).astype(np.float32)
+
+
+def voxel_downsample_xyz(X, y, voxel):
+    if voxel <= 0:
+        return X, y
+    xyz = X[:, :3]
+    mins = xyz.min(axis=0, keepdims=True)
+    q = np.floor((xyz - mins) / voxel).astype(np.int64)
+    key = q[:, 0] * 73856093 ^ q[:, 1] * 19349663 ^ q[:, 2] * 83492791
+    _, idx = np.unique(key, return_index=True)
+    return X[idx], y[idx]
+
+
+def confusion(pred, gt, n):
+    C = np.zeros((n, n), dtype=np.int64)
+    for p, g in zip(pred, gt):
+        if 0 <= g < n and 0 <= p < n:
+            C[g, p] += 1
+    return C
+
+
+def iou_from_conf(C):
+    ious = []
+    for i in range(C.shape[0]):
+        tp = C[i, i]
+        fp = C[:, i].sum() - tp
+        fn = C[i, :].sum() - tp
+        den = tp + fp + fn
+        ious.append(tp / den if den > 0 else 0.0)
+    return np.array(ious, dtype=np.float64)
+
+
+def miou_present(ious, supports):
+    mask = supports >= 1
+    if mask.sum() == 0:
+        return 0.0
+    return float(np.mean(ious[mask]))
+
+
+def focal_loss(logits, targets, weight=None, gamma=2.0):
+    """
+    Focal Loss para clasificación multiclase.
+
+    logits:  (M, ncls)
+    targets: (M,)
+    weight:  tensor (ncls,) o None
+    gamma:   focal gamma (típico 2.0)
+    """
+    ce = F.cross_entropy(logits, targets, weight=weight, reduction="none")
+    pt = torch.exp(-ce)  # prob. de la clase correcta (aprox)
+    loss = ((1.0 - pt) ** gamma) * ce
+    return loss.mean()
+
+
+def read_ply_xyzI_and_labels(ply_path, use_intensity=True):
+    ply = PlyData.read(str(ply_path))
+    v = ply["vertex"].data
+    names = v.dtype.names
+
+    key = _find_label_key(names)
+    if key is None:
+        raise SystemExit(f"No encuentro columna etiqueta (class/label/...) en {ply_path}")
+
+    xyz = np.vstack([v["x"], v["y"], v["z"]]).T.astype(np.float32)
+
+    if use_intensity:
+        if "intensity" in names:
+            inten = np.asarray(v["intensity"], dtype=np.float32).reshape(-1, 1)
+        else:
+            inten = np.zeros((len(xyz), 1), np.float32)
+        X = np.concatenate([xyz, inten], axis=1).astype(np.float32)
+    else:
+        X = xyz.astype(np.float32)
+
+    y_raw = np.asarray(v[key], dtype=np.int64)
+    return X, y_raw
+
+
+def apply_stride_if_needed(X, y, max_points):
+    n_total = len(X)
+    if max_points is None or max_points <= 0 or n_total <= max_points:
+        return X, y, 1, n_total, n_total
+    stride = int(np.ceil(n_total / max_points))
+    X2 = X[::stride]
+    y2 = y[::stride]
+    return X2, y2, stride, n_total, len(X2)
+
+
+def load_tile(ply_path, use_intensity, voxel, max_points_per_tile):
+    X, y_raw = read_ply_xyzI_and_labels(ply_path, use_intensity=use_intensity)
+
+    X, y_raw, stride, before, after = apply_stride_if_needed(X, y_raw, max_points_per_tile)
+    if stride > 1:
+        print(f"   · stride 1/{stride}  ({before:,} -> {after:,} puntos)")
+
+    X, y_raw = voxel_downsample_xyz(X, y_raw, voxel)
+    print(f"   · voxel {voxel:g} -> {len(X):,} puntos")
+
+    return X, y_raw
+
+
+# ----------------------------
+# Modelo
+# ----------------------------
+class PointNet2LiteSeg(torch.nn.Module):
+    """
+    Modelo 'lite' compatible con tu checkpoint:
+      stem:  in_dim -> 64 -> 128
+      local: (128 + 128 + 3) -> 128 -> 128     (si use_global=True)
+      head:  (128 + 128 + 128) -> 128 -> 64 -> ncls   (si use_global=True)
+
+    IMPORTANTE:
+      - forward acepta:
+          (x) donde x es (B,N,in_dim) y las 3 primeras dims son XYZ
+        o (xyz, feat) donde xyz es (B,N,3) y feat es (B,N,in_dim-3) o (B,N,1) para intensity.
+    """
+
+    def __init__(self, in_dim: int, ncls: int, use_global: bool = True):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.ncls = int(ncls)
+        self.use_global = bool(use_global)
+
+        # stem: in_dim -> 64 -> 128  (esto tiene que cuadrar con tus ckpts)
+        self.stem = torch.nn.Sequential(
+            torch.nn.Linear(self.in_dim, 64),
+            torch.nn.ReLU(True),
+            torch.nn.Linear(64, 128),
+            torch.nn.ReLU(True),
+        )
+
+        # local_mlp: concat(point_feat=128, global_feat=128, xyz=3) => 259
+        local_in = 128 + 3 + (128 if self.use_global else 0)
+        self.local_mlp = torch.nn.Sequential(
+            torch.nn.Linear(local_in, 128),
+            torch.nn.ReLU(True),
+            torch.nn.Linear(128, 128),
+            torch.nn.ReLU(True),
+        )
+
+        # head: concat(point_feat=128, local=128, global=128) => 384
+        head_in = 128 + 128 + (128 if self.use_global else 0)
+        self.head = torch.nn.Sequential(
+            torch.nn.Linear(head_in, 128),
+            torch.nn.ReLU(True),
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(True),
+            torch.nn.Linear(64, self.ncls),
+        )
+
+    def forward(self, x, feat=None):
+        # Caso 1: nos pasan xyz,feat
+        if feat is not None:
+            xyz = x
+            # construimos x_in = [xyz, feat] si hace falta
+            if feat.ndim == 2:
+                feat = feat.unsqueeze(-1)
+            x_in = torch.cat([xyz, feat], dim=-1) if feat.shape[-1] > 0 else xyz
+        else:
+            # Caso 2: nos pasan x concatenado
+            x_in = x
+            xyz = x_in[..., :3]
+
+        # point features
+        pf = self.stem(x_in)  # (B,N,128)
+
+        if self.use_global:
+            gf, _ = torch.max(pf, dim=1)  # (B,128)
+            gf_rep = gf.unsqueeze(1).expand(-1, pf.shape[1], -1)  # (B,N,128)
+            local_in = torch.cat([pf, gf_rep, xyz], dim=-1)  # (B,N,259)
+            local = self.local_mlp(local_in)  # (B,N,128)
+            head_in = torch.cat([pf, local, gf_rep], dim=-1)  # (B,N,384)
+        else:
+            local_in = torch.cat([pf, xyz], dim=-1)  # (B,N,131)
+            local = self.local_mlp(local_in)  # (B,N,128)
+            head_in = torch.cat([pf, local], dim=-1)  # (B,N,256)
+
+        logits = self.head(head_in)  # (B,N,ncls)
+        return logits
+
+
+# ----------------------------
+# Eval en un tile (para validación estable)
+# ----------------------------
+@torch.no_grad()
+def eval_on_arrays(model, X, y, ncls, block_points=1024, seed=0, device="cpu"):
+    rs = np.random.RandomState(seed)
+    N = len(X)
+    idx = rs.permutation(N)
+
+    pred = np.empty((N,), dtype=np.int64)
+
+    # procesamos en bloques "sin solape" (cada punto 1 vez) -> estable
+    for s in range(0, N, block_points):
+        sel = idx[s : s + block_points]
+        xb = X[sel]
+        xb_t = torch.from_numpy(xb).unsqueeze(0).to(device)  # (1,B,in_dim)
+        out = model(xb_t)  # (1,B,ncls)
+        p = out.argmax(-1).squeeze(0).cpu().numpy()
+        pred[sel] = p
+
+    C = confusion(pred, y, ncls)
+    ious = iou_from_conf(C)
+    oa = float(np.trace(C) / max(1, C.sum()))
+    miou = float(np.mean(ious))
+    supports = np.array([C[i, :].sum() for i in range(ncls)], dtype=np.int64)
+    miou_p = miou_present(ious, supports)
+    return oa, miou, miou_p
+
+
+# ----------------------------
+# Main train
+# ----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--dataset_dir", required=True, type=str)
+    ap.add_argument("--mode", default="train", choices=["train"], type=str)
+
+    ap.add_argument(
+        "--train_limit",
+        type=int,
+        default=10,
+        help="Número total de tiles a considerar (el último se usa como val).",
+    )
+    ap.add_argument("--epochs", type=int, default=20)
+
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--n_points", type=int, default=1024)
+    ap.add_argument("--sample_per_epoch", type=int, default=400000)
+
+    ap.add_argument("--voxel", type=float, default=0.15)
+    ap.add_argument("--max_points_per_tile", type=int, default=1000000)
+
+    ap.add_argument("--use_intensity", action="store_true")
+    ap.add_argument("--augment", action="store_true")
+    ap.add_argument("--use_global", action="store_true")
+
+    ap.add_argument(
+        "--class_sampling_power",
+        type=float,
+        default=0.0,
+        help="0 = muestreo uniforme; >0 sobre-muestrea clases raras.",
+    )
+    ap.add_argument("--class_weights", action="store_true", help="Pone pesos en CE según 1/sqrt(freq).")
+
+    # ---- NUEVO: loss + focal + cap de pesos ----
+    ap.add_argument(
+        "--loss",
+        type=str,
+        default="ce",
+        choices=["ce", "focal"],
+        help="Loss: ce (cross-entropy) o focal (recomendado para imbalance).",
+    )
+    ap.add_argument("--focal_gamma", type=float, default=2.0, help="Gamma de focal loss (típico 2.0).")
+    ap.add_argument(
+        "--class_weight_cap",
+        type=float,
+        default=5.0,
+        help="Tope máximo para los pesos de clase (evita colapso en imbalance extremo).",
+    )
+
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=123)
+
+    ap.add_argument("--val_block_points", type=int, default=1024)
+    ap.add_argument("--val_max_points", type=int, default=200000, help="Cap de puntos para validar rápido (0 = sin cap).")
+
+    ap.add_argument("--out_ckpt", type=str, default="outputs/checkpoints/pointnet2lite_plateau.pt")
+
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[device] {device}")
+
+    # tiles
+    train_dir = Path(args.dataset_dir) / "train"
+    if not train_dir.exists():
+        raise SystemExit(f"No existe: {train_dir}")
+
+    tiles = sorted(train_dir.glob("*.ply"))
+    if len(tiles) == 0:
+        raise SystemExit(f"No hay .ply en {train_dir}")
+
+    if args.train_limit > 0:
+        tiles = tiles[: args.train_limit]
+
+    # Split: último tile = val
+    if len(tiles) < 2:
+        raise SystemExit("Necesito al menos 2 tiles (train+val).")
+
+    train_tiles = tiles[:-1]
+    val_tiles = tiles[-1:]
+
+    print(f"[train] loading {len(train_tiles)} tile(s)…")
+    X_train_raw = []
+    y_train_raw = []
+    for p in train_tiles:
+        print(f" - Leyendo {p.name}")
+        Xp, yp = load_tile(p, args.use_intensity, args.voxel, args.max_points_per_tile)
+        X_train_raw.append(Xp)
+        y_train_raw.append(yp)
+
+    # labels (SIEMPRE desde train)
+    all_train_labels = np.concatenate(y_train_raw, axis=0)
+    label_values = np.unique(all_train_labels).astype(np.int64)
+    label_values = np.sort(label_values)
+    ncls = int(len(label_values))
+    print(f"[train] ncls={ncls} labels={label_values.tolist()}")
+
+    # remapeo train -> idx [0..ncls-1]
+    X_train = []
+    y_train = []
+    for Xp, yp in zip(X_train_raw, y_train_raw):
+        yi = np.searchsorted(label_values, yp).astype(np.int64)
+        X_train.append(normalize_feats(Xp))
+        y_train.append(yi)
+
+    # val
+    print(f"[val] loading {len(val_tiles)} tile(s)…")
+    X_val = []
+    y_val = []
+    for p in val_tiles:
+        print(f" - Leyendo {p.name}")
+        Xp, yp = load_tile(p, args.use_intensity, args.voxel, args.max_points_per_tile)
+        yi = np.searchsorted(label_values, yp).astype(np.int64)
+        X_val.append(normalize_feats(Xp))
+        y_val.append(yi)
+
+    # si queremos cap en val (para rapidez)
+    if args.val_max_points and args.val_max_points > 0:
+        Xv = X_val[0]
+        yv = y_val[0]
+        if len(Xv) > args.val_max_points:
+            stride = int(np.ceil(len(Xv) / args.val_max_points))
+            X_val[0] = Xv[::stride]
+            y_val[0] = yv[::stride]
+            print(f"[val] stride 1/{stride}: {len(Xv):,} -> {len(X_val[0]):,}")
+
+    in_dim = 4 if args.use_intensity else 3
+    model = PointNet2LiteSeg(in_dim=in_dim, ncls=ncls, use_global=args.use_global).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # class weights (para CE / focal)
+    ce_weight = None
+    if args.class_weights:
+        counts = np.zeros((ncls,), dtype=np.int64)
+        for yt in y_train:
+            counts += np.bincount(yt, minlength=ncls)
+        w = 1.0 / np.sqrt(counts.astype(np.float64) + 1e-6)
+        w = w / max(1e-12, w.mean())
+
+        # CAP para que no se dispare el peso de clases raras
+        w = np.minimum(w, float(args.class_weight_cap))
+
+        ce_weight = torch.from_numpy(w.astype(np.float32)).to(device)
+
+    # prob de muestreo por punto (solo si power>0)
+    # Nota: para power=0 no lo usamos (rápido).
+    tile_probs = None
+    if args.class_sampling_power > 0:
+        tile_probs = []
+        for yt in y_train:
+            counts = np.bincount(yt, minlength=ncls).astype(np.float64)
+            per_class = (1.0 / (counts + 1e-6)) ** float(args.class_sampling_power)
+            per_point = per_class[yt]
+            per_point = per_point / per_point.sum()
+            tile_probs.append(per_point.astype(np.float64))
+
+    rs_global = np.random.RandomState(args.seed)
+
+    steps_per_epoch = int(np.ceil(args.sample_per_epoch / (args.batch_size * args.n_points)))
+
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        losses = []
+
+        for _ in range(steps_per_epoch):
+            xb_list = []
+            yb_list = []
+            for _b in range(args.batch_size):
+                tid = rs_global.randint(0, len(X_train))
+                Xt = X_train[tid]
+                yt = y_train[tid]
+
+                if len(Xt) >= args.n_points:
+                    if tile_probs is None:
+                        idx = rs_global.choice(len(Xt), size=args.n_points, replace=False)
+                    else:
+                        idx = rs_global.choice(len(Xt), size=args.n_points, replace=False, p=tile_probs[tid])
+                else:
+                    # si el tile es pequeño, muestreamos con reemplazo
+                    idx = rs_global.choice(len(Xt), size=args.n_points, replace=True)
+
+                xb = Xt[idx].copy()
+                yb = yt[idx].copy()
+
+                # augment (solo xyz)
+                if args.augment:
+                    # rotación Z
+                    ang = rs_global.uniform(0, 2 * np.pi)
+                    c, s = np.cos(ang), np.sin(ang)
+                    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+                    xb[:, :3] = xb[:, :3] @ R.T
+                    # jitter
+                    xb[:, :3] += rs_global.normal(0.0, 0.01, size=xb[:, :3].shape).astype(np.float32)
+
+                xb_list.append(xb)
+                yb_list.append(yb)
+
+            xb_t = torch.from_numpy(np.stack(xb_list, axis=0)).to(device)  # (bs,n_points,in_dim)
+            yb_t = torch.from_numpy(np.stack(yb_list, axis=0)).to(device)  # (bs,n_points)
+
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb_t)  # (bs,n_points,ncls)
+
+            logits2 = logits.reshape(-1, ncls)
+            y2 = yb_t.reshape(-1)
+
+            if args.loss == "focal":
+                loss = focal_loss(logits2, y2, weight=ce_weight, gamma=args.focal_gamma)
+            else:
+                loss = F.cross_entropy(logits2, y2, weight=ce_weight)
+
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.item()))
+
+        # Validación ESTABLE: evaluamos el tile val con bloques fijos
+        model.eval()
+        oa, miou, miou_p = eval_on_arrays(
+            model,
+            X_val[0],
+            y_val[0],
+            ncls=ncls,
+            block_points=args.val_block_points,
+            seed=args.seed,  # estable entre épocas (curva limpia)
+            device=device,
+        )
+
+        print(f"[ep {ep:03d}] loss={np.mean(losses):.4f} val_OA={oa:.3f} val_mIoU={miou:.3f} val_mIoU_present={miou_p:.3f}")
+
+    # Guardar ckpt con metadatos (CLAVE para que eval sea robusto)
+    out_path = Path(args.out_ckpt)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ckpt = {
+        "model_class": "PointNet2LiteSeg",
+        "model": model.state_dict(),
+        "in_dim": int(in_dim),
+        "num_classes": int(ncls),
+        "label_values": label_values.astype(np.int64).tolist(),
+        "use_global": bool(args.use_global),
+        "use_intensity": bool(args.use_intensity),
+        # metadatos de loss (útil para trazabilidad)
+        "loss": str(args.loss),
+        "focal_gamma": float(args.focal_gamma),
+        "class_weight_cap": float(args.class_weight_cap),
+    }
+    torch.save(ckpt, str(out_path))
+    print(f"[OK] saved checkpoint to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
+

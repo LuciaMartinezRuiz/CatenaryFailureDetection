@@ -1,26 +1,34 @@
-# inspect_ply_headers.py
 from pathlib import Path
 from plyfile import PlyData
+import argparse
 
-# Mira los primeros .ply de TRAIN (cambia la ruta si la tuya es distinta)
-train_dir = Path("data/raw/WHU-Railway3D/Urban/tiles/train")
-files = sorted(train_dir.glob("*.ply"))
-if not files:
-    raise SystemExit("No se encontraron .ply en 'Urban/tiles/train'")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset_dir", type=str, required=True)
+    ap.add_argument("--split", type=str, default="train", choices=["train","test"])
+    ap.add_argument("--n", type=int, default=5)
+    args = ap.parse_args()
 
-# Candidatos de nombre para la columna de etiquetas
-candidates = [
-    "label","semantic","class","classification",
-    "category","category_id","seg_label",
-    "scalar_Label","scalar_label","Scalar_Label"
-]
+    d = Path(args.dataset_dir).expanduser().resolve() / args.split
+    files = sorted(d.glob("*.ply"))
+    if not files:
+        raise SystemExit(f"No se encontraron .ply en {d}")
 
-for f in files[:5]:  # inspecciona hasta 5 ficheros
-    ply = PlyData.read(str(f))
-    names = ply["vertex"].data.dtype.names
-    label_key = next((k for k in candidates if k in names), None)
+    candidates = [
+        "label","semantic","class","classification",
+        "category","category_id","seg_label",
+        "scalar_Label","scalar_label","Scalar_Label"
+    ]
 
-    print("\n==========")
-    print("Archivo:", f.name)
-    print("Columnas de 'vertex':", names)
-    print("Columna de etiqueta detectada:", label_key)
+    for f in files[:args.n]:
+        ply = PlyData.read(str(f))
+        names = ply["vertex"].data.dtype.names
+        label_key = next((k for k in candidates if k in names), None)
+        print("\n==========")
+        print("Archivo:", f.name)
+        print("Columnas vertex:", names)
+        print("Etiqueta detectada:", label_key)
+
+if __name__ == "__main__":
+    main()
+
